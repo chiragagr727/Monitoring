@@ -1,37 +1,28 @@
-/* Lightweight API client. */
+/* NeevCloud API client — fixed getHistory to pass hours correctly */
 const API = (() => {
-  const STORAGE_KEY = 'neev_token';
-  const USER_KEY = 'neev_user';
+  const TK = 'neev_token', UK = 'neev_user';
 
-  function getToken() { return localStorage.getItem(STORAGE_KEY); }
-  function setToken(t) { localStorage.setItem(STORAGE_KEY, t); }
-  function getUser() {
-    const raw = localStorage.getItem(USER_KEY);
-    return raw ? JSON.parse(raw) : null;
-  }
-  function setUser(u) { localStorage.setItem(USER_KEY, JSON.stringify(u)); }
-  function clear() { localStorage.removeItem(STORAGE_KEY); localStorage.removeItem(USER_KEY); }
+  const getToken = () => localStorage.getItem(TK);
+  const setToken = t => localStorage.setItem(TK, t);
+  const getUser  = () => { try { return JSON.parse(localStorage.getItem(UK)); } catch { return null; } };
+  const setUser  = u => localStorage.setItem(UK, JSON.stringify(u));
+  const clear    = () => { localStorage.removeItem(TK); localStorage.removeItem(UK); };
 
   async function req(path, opts = {}) {
-    const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
-    const token = getToken();
-    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const hdrs = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+    const tok = getToken();
+    if (tok) hdrs['Authorization'] = 'Bearer ' + tok;
     const resp = await fetch(path, {
-      ...opts,
-      headers,
-      body: opts.body ? JSON.stringify(opts.body) : undefined,
+      method: opts.method || 'GET',
+      headers: hdrs,
+      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
     });
     const ct = resp.headers.get('content-type') || '';
     const data = ct.includes('application/json') ? await resp.json() : await resp.text();
     if (!resp.ok) {
-      const msg = (data && data.error) || (typeof data === 'string' ? data : 'Request failed');
-      const err = new Error(msg);
-      err.status = resp.status;
-      err.payload = data;
-      if (resp.status === 401) {
-        clear();
-        location.hash = '#/login';
-      }
+      const msg = (data && data.error) ? data.error : (typeof data === 'string' ? data : 'Request failed');
+      const err = new Error(msg); err.status = resp.status;
+      if (resp.status === 401) { clear(); location.hash = '#/login'; }
       throw err;
     }
     return data;
@@ -39,27 +30,34 @@ const API = (() => {
 
   return {
     getToken, setToken, getUser, setUser, clear,
-    login: (email, password) => req('/api/auth/login', { method: 'POST', body: { email, password } }),
-    register: (body) => req('/api/auth/register', { method: 'POST', body }),
-    me: () => req('/api/auth/me'),
-
-    listHosts: () => req('/api/hosts'),
-    addHost: (body) => req('/api/hosts', { method: 'POST', body }),
-    getHost: (id) => req('/api/hosts/' + id),
-    deleteHost: (id) => req('/api/hosts/' + id, { method: 'DELETE' }),
-    getInstall: (id) => req('/api/hosts/' + id + '/install'),
-    getHistory: (id, itemId, hours = 2) => req(`/api/hosts/${id}/history?itemid=${itemId}&hours=${hours}`),
-    allProblems: () => req('/api/hosts/problems/all'),
-
-    health: () => req('/api/health'),
+    login:    (email, pw) => req('/api/auth/login',    { method: 'POST', body: { email, password: pw } }),
+    register: body        => req('/api/auth/register', { method: 'POST', body }),
+    me:       ()          => req('/api/auth/me'),
+    listHosts:   ()       => req('/api/hosts'),
+    addHost:     body     => req('/api/hosts', { method: 'POST', body }),
+    getHost:     id       => req('/api/hosts/' + id),
+    deleteHost:  id       => req('/api/hosts/' + id, { method: 'DELETE' }),
+    getInstall:  id       => req('/api/hosts/' + id + '/install'),
+    // hours: number of hours to look back (1H=1, 6H=6, 1D=24, 1W=168, 1M=720)
+    getHistory:  (id, itemId, hours) => req(`/api/hosts/${id}/history?itemid=${itemId}&hours=${hours || 24}`),
+    allProblems: ()       => req('/api/hosts/problems/all'),
+    health:      ()       => req('/api/health'),
   };
 })();
 
-function toast(msg, type = '') {
+/* Toast notification */
+function toast(msg, type) {
   const el = document.createElement('div');
-  el.className = 'toast ' + (type === 'err' ? 'err' : '');
+  el.className = 'toast' + (type === 'err' ? ' err' : '');
   el.textContent = msg;
   document.getElementById('toast-container').appendChild(el);
-  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; }, 3000);
-  setTimeout(() => el.remove(), 3500);
+  setTimeout(() => { el.style.transition = 'opacity .3s'; el.style.opacity = '0'; }, 3200);
+  setTimeout(() => el.remove(), 3600);
+}
+
+/* HTML escape helper — used across all views */
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g,
+    c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
+  );
 }

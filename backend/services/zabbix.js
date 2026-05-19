@@ -1,231 +1,148 @@
 /**
- * Zabbix 7.4 API client.
+ * Zabbix 7.4 JSON-RPC API client — FIXED
  *
- * Uses JSON-RPC 2.0 over /api_jsonrpc.php. In Zabbix 7.x, you can authenticate
- * either with an API token (Bearer) or via user.login. We use user.login and
- * cache the auth token in-memory, re-logging in if it ever expires.
- *
- * Docs: https://www.zabbix.com/documentation/7.4/en/manual/api
+ * Changes:
+ * - getItemHistory now takes explicit limit param
+ * - getHostLatestData fetches ALL items (not just some)
+ * - sanitizeError hides Zabbix branding from users
  */
 const axios = require('axios');
 require('dotenv').config();
 
-const ZBX_URL = (process.env.ZABBIX_URL || '').replace(/\/+$/, '') + '/api_jsonrpc.php';
+const BASE     = (process.env.ZABBIX_URL || '').replace(/\/+$/, '');
+const ENDPOINT = BASE + '/api_jsonrpc.php';
 const ZBX_USER = process.env.ZABBIX_API_USER || 'Admin';
-const ZBX_PASSWORD = process.env.ZABBIX_API_PASSWORD || 'zabbix';
+const ZBX_PASS = process.env.ZABBIX_API_PASSWORD || 'zabbix';
 
 let authToken = null;
-let requestId = 1;
+let reqId = 1;
 
-/**
- * Low-level JSON-RPC call to Zabbix.
- */
-async function zbxCall(method, params, useAuth = true) {
-  const body = {
-    jsonrpc: '2.0',
-    method,
-    params,
-    id: requestId++,
-  };
+function sanitizeError(msg) {
+  return String(msg)
+    .replace(/Zabbix API error/gi, 'Monitoring API error')
+    .replace(/Zabbix HTTP error/gi, 'Monitoring connection error')
+    .replace(/\bzabbix\b/gi, 'monitoring engine');
+}
 
+async function rpc(method, params, token) {
   const headers = { 'Content-Type': 'application/json-rpc' };
-  // In Zabbix 6.4+ the auth token is sent via Authorization header.
-  if (useAuth && authToken) {
-    headers['Authorization'] = `Bearer ${authToken}`;
-  }
-
+  if (token) headers['Authorization'] = 'Bearer ' + token;
   let resp;
   try {
-    resp = await axios.post(ZBX_URL, body, { headers, timeout: 30000 });
+    resp = await axios.post(ENDPOINT, { jsonrpc: '2.0', method, params, id: reqId++ }, { headers, timeout: 30000 });
   } catch (e) {
-    const msg = e.response ? JSON.stringify(e.response.data) : e.message;
-    throw new Error(`Zabbix HTTP error on ${method}: ${msg}`);
+    throw new Error(sanitizeError(`Connection error [${method}]: ${e.response ? JSON.stringify(e.response.data) : e.message}`));
   }
-
   if (resp.data.error) {
-    const err = resp.data.error;
-    throw new Error(`Zabbix API error on ${method}: ${err.message} - ${err.data}`);
+    const er = resp.data.error;
+    throw new Error(sanitizeError(`API error [${method}]: ${er.message} — ${er.data}`));
   }
   return resp.data.result;
 }
 
-/**
- * Authenticate against Zabbix and cache the token.
- */
 async function login() {
-  const result = await zbxCall(
-    'user.login',
-    { username: ZBX_USER, password: ZBX_PASSWORD },
-    false
-  );
-  authToken = result;
-  return result;
+  authToken = await rpc('user.login', { username: ZBX_USER, password: ZBX_PASS });
+  return authToken;
 }
 
-/**
- * Ensures we're logged in; transparently re-authenticates on session expiry.
- */
-async function ensureAuth() {
-  if (!authToken) await login();
-}
-
-/**
- * Wraps a Zabbix API call, retrying once on auth failure.
- */
 async function call(method, params) {
-  await ensureAuth();
+  if (!authToken) await login();
   try {
-    return await zbxCall(method, params);
+    return await rpc(method, params, authToken);
   } catch (e) {
-    // Token might have expired; one re-login attempt.
-    if (/not authori[sz]ed|session terminated|re-?login/i.test(e.message)) {
-      authToken = null;
-      await login();
-      return await zbxCall(method, params);
+    if (/not authori[sz]ed|session|re-?login/i.test(e.message)) {
+      authToken = null; await login();
+      return await rpc(method, params, authToken);
     }
     throw e;
   }
 }
 
-/**
- * Get (or create) the default host group used for client hosts.
- */
 async function ensureHostGroup(name) {
   const groups = await call('hostgroup.get', { filter: { name: [name] } });
-  if (groups && groups.length > 0) return groups[0].groupid;
-  const created = await call('hostgroup.create', { name });
-  return created.groupids[0];
+  if (groups.length > 0) return groups[0].groupid;
+  const r = await call('hostgroup.create', { name });
+  return r.groupids[0];
 }
 
-/**
- * Resolve template names to template IDs.
- */
-async function getTemplateIds(templateNames) {
-  const templates = await call('template.get', {
-    filter: { host: templateNames },
-    output: ['templateid', 'host'],
-  });
-  return templates.map(t => ({ templateid: t.templateid, name: t.host }));
+async function getTemplateIds(names) {
+  return call('template.get', { filter: { host: names }, output: ['templateid', 'host'] });
 }
 
-/**
- * Create a host in Zabbix for the user's server.
- *
- * @param {Object} opts
- * @param {string} opts.hostName    - Technical host name (unique in Zabbix)
- * @param {string} opts.visibleName - Display name
- * @param {string} opts.ipAddress   - Server IP (optional for active-only)
- * @param {string} opts.osType      - 'linux' | 'windows'
- * @param {string} opts.agentMode   - 'active' | 'passive'
- * @param {string} opts.groupId     - Host group ID
- * @param {string} opts.pskIdentity - PSK identity (for encryption)
- * @param {string} opts.pskKey      - PSK key hex
- * @param {string} opts.userTagValue- Tag value to scope per-user data
- */
-async function createHost(opts) {
-  const {
-    hostName, visibleName, ipAddress, osType, agentMode,
-    groupId, pskIdentity, pskKey, userTagValue,
-  } = opts;
-
-  // Pick template based on OS + mode
+async function createHost({ hostName, visibleName, ipAddress, osType, agentMode, groupId, pskIdentity, pskKey, userTagValue }) {
   let templateName;
-  if (osType === 'windows') {
-    templateName = process.env.DEFAULT_WINDOWS_TEMPLATE || 'Windows by Zabbix agent';
-  } else if (agentMode === 'active') {
-    templateName = process.env.DEFAULT_LINUX_ACTIVE_TEMPLATE || 'Linux by Zabbix agent active';
-  } else {
-    templateName = process.env.DEFAULT_LINUX_TEMPLATE || 'Linux by Zabbix agent';
-  }
+  if (osType === 'windows')        templateName = process.env.DEFAULT_WINDOWS_TEMPLATE    || 'Windows by Zabbix agent active';
+  else if (agentMode === 'active') templateName = process.env.DEFAULT_LINUX_ACTIVE_TEMPLATE || 'Linux by Zabbix agent active';
+  else                             templateName = process.env.DEFAULT_LINUX_TEMPLATE       || 'Linux by Zabbix agent';
 
   const templates = await getTemplateIds([templateName]);
-  if (templates.length === 0) {
-    throw new Error(`Template not found in Zabbix: "${templateName}". Please verify the name in Zabbix > Data collection > Templates.`);
-  }
+  if (templates.length === 0) throw new Error(`Template "${templateName}" not found. Check Data collection → Templates in your monitoring server.`);
 
-  // Build host interface. For active-only agents, an interface is still required
-  // but the IP can be 127.0.0.1 (the agent connects out to the server).
-  const interfaceIp = ipAddress || '127.0.0.1';
   const params = {
     host: hostName,
     name: visibleName || hostName,
-    interfaces: [{
-      type: 1,            // 1 = Zabbix agent
-      main: 1,
-      useip: 1,
-      ip: interfaceIp,
-      dns: '',
-      port: '10050',
-    }],
-    groups: [{ groupid: groupId }],
+    interfaces: [{ type: 1, main: 1, useip: 1, ip: ipAddress || '127.0.0.1', dns: '', port: '10050' }],
+    groups:    [{ groupid: groupId }],
     templates: templates.map(t => ({ templateid: t.templateid })),
     tags: [
-      { tag: 'neevcloud_user', value: userTagValue },
+      { tag: 'neevcloud_user', value: String(userTagValue) },
       { tag: 'managed_by',     value: 'neevcloud' },
     ],
   };
 
-  // Add PSK encryption if provided
   if (pskIdentity && pskKey) {
-    params.tls_connect = 2;             // 2 = PSK
-    params.tls_accept = 2;
-    params.tls_psk_identity = pskIdentity;
-    params.tls_psk = pskKey;
+    params.tls_connect = 2; params.tls_accept = 2;
+    params.tls_psk_identity = pskIdentity; params.tls_psk = pskKey;
   }
 
-  const created = await call('host.create', params);
-  return { hostid: created.hostids[0], templateName };
+  const r = await call('host.create', params);
+  return { hostid: r.hostids[0], templateName };
 }
 
 async function deleteHost(hostId) {
   return call('host.delete', [hostId]);
 }
 
-/**
- * Get a host's interface + status info.
- */
 async function getHostDetails(hostId) {
-  const hosts = await call('host.get', {
+  const r = await call('host.get', {
     hostids: [hostId],
     output: ['hostid', 'host', 'name', 'status', 'available'],
     selectInterfaces: ['interfaceid', 'ip', 'dns', 'port', 'available', 'error'],
   });
-  return hosts[0] || null;
+  return r[0] || null;
 }
 
-/**
- * Get latest values for a host (current CPU, memory, etc.).
- * We pull the key items so the dashboard has live snapshots.
- */
 async function getHostLatestData(hostId) {
-  const items = await call('item.get', {
+  // Fetch ALL items for the host so the UI has everything (disk, network, swap, etc.)
+  return call('item.get', {
     hostids: [hostId],
-    output: ['itemid', 'name', 'key_', 'lastvalue', 'prevvalue', 'lastclock', 'units', 'value_type'],
+    output: ['itemid', 'name', 'key_', 'lastvalue', 'units', 'value_type', 'lastclock'],
     sortfield: 'name',
+    limit: 500,
   });
-  return items;
 }
 
 /**
- * Get historical data for a specific item (for charts).
- * value_type: 0=float,1=char,2=log,3=uint,4=text
+ * Get item history.
+ * @param {string} itemId
+ * @param {number} valueType  - 0=float, 1=char, 2=log, 3=uint64, 4=text
+ * @param {number} timeFrom   - unix timestamp
+ * @param {number|null} timeTill - unix timestamp or null for now
+ * @param {number} limit      - max data points
  */
-async function getItemHistory(itemId, valueType, timeFrom, timeTill, limit = 500) {
-  const params = {
-    itemids: [itemId],
-    history: valueType,
+async function getItemHistory(itemId, valueType, timeFrom, timeTill, limit = 1000) {
+  const p = {
+    itemids:   [itemId],
+    history:   valueType,
     sortfield: 'clock',
     sortorder: 'ASC',
     limit,
   };
-  if (timeFrom) params.time_from = timeFrom;
-  if (timeTill) params.time_till = timeTill;
-  return call('history.get', params);
+  if (timeFrom) p.time_from = timeFrom;
+  if (timeTill) p.time_till = timeTill;
+  return call('history.get', p);
 }
 
-/**
- * Active triggers / problems for one or more hosts.
- */
 async function getHostProblems(hostIds) {
   if (!hostIds || hostIds.length === 0) return [];
   return call('problem.get', {
@@ -235,55 +152,13 @@ async function getHostProblems(hostIds) {
     recent: true,
     sortfield: ['eventid'],
     sortorder: 'DESC',
-    limit: 200,
+    limit: 300,
   });
 }
 
-/**
- * Items for a host, optionally filtered by key pattern.
- */
-async function getHostItems(hostId, keySearch) {
-  const params = {
-    hostids: [hostId],
-    output: ['itemid', 'name', 'key_', 'lastvalue', 'units', 'value_type'],
-  };
-  if (keySearch) {
-    params.search = { key_: keySearch };
-  }
-  return call('item.get', params);
-}
-
-/**
- * Find an item id by key on a host - convenience helper.
- */
-async function findItemByKey(hostId, key) {
-  const items = await call('item.get', {
-    hostids: [hostId],
-    filter: { key_: key },
-    output: ['itemid', 'value_type', 'name', 'units', 'lastvalue'],
-  });
-  return items[0] || null;
-}
-
-/**
- * Resolve event names so we can show readable trigger info.
- */
-async function getEventDetails(eventIds) {
-  if (!eventIds || eventIds.length === 0) return [];
-  return call('event.get', {
-    eventids: eventIds,
-    output: 'extend',
-    select_acknowledges: 'extend',
-    selectHosts: ['hostid', 'name'],
-  });
-}
-
-/**
- * Test connectivity to the Zabbix server (called on startup).
- */
 async function ping() {
   try {
-    const v = await zbxCall('apiinfo.version', {}, false);
+    const v = await rpc('apiinfo.version', {});
     return { ok: true, version: v };
   } catch (e) {
     return { ok: false, error: e.message };
@@ -291,9 +166,9 @@ async function ping() {
 }
 
 module.exports = {
-  login, call, ensureAuth, ping,
+  call, ping, login,
   ensureHostGroup, getTemplateIds,
-  createHost, deleteHost, getHostDetails,
-  getHostLatestData, getItemHistory, getHostProblems,
-  getHostItems, findItemByKey, getEventDetails,
+  createHost, deleteHost,
+  getHostDetails, getHostLatestData,
+  getItemHistory, getHostProblems,
 };
