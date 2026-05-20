@@ -1,21 +1,19 @@
-/* App bootstrap. */
-function requireAuth(handler) {
-  return (params) => {
-    if (!API.getToken()) {
-      location.hash = '#/login';
-      return;
-    }
-    handler(params);
+function auth(fn) {
+  return params => {
+    if (!API.getToken()) { location.hash = '#/login'; return; }
+    fn(params);
   };
 }
 
-Router.on('/login',          () => LoginView.render('login'));
-Router.on('/register',       () => LoginView.render('register'));
-Router.on('/',               requireAuth(() => Dashboard.render()));
-Router.on('/add',            requireAuth(() => AddHost.render()));
-Router.on('/host/:id',       requireAuth((p) => HostDetail.render(p)));
-Router.on('/alerts',         requireAuth(() => Alerts.render()));
+Router.on('/login',    ()  => LoginView.render('login'));
+Router.on('/register', ()  => LoginView.render('register'));
+Router.on('/',         auth(() => Dashboard.render()));
+Router.on('/add',      auth(() => AddHost.render()));
+Router.on('/alerts',   auth(() => AlertsView.render()));
+Router.on('/host/:id', auth(p  => HostDetail.render(p)));
 
-// Boot
-if (!location.hash) location.hash = API.getToken() ? '#/' : '#/login';
-Router.resolve();
+if (!location.hash || location.hash === '#') {
+  location.hash = API.getToken() ? '#/' : '#/login';
+} else {
+  Router.resolve();
+}

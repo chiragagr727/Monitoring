@@ -1,145 +1,124 @@
-/* Dashboard - list of user's hosts. */
 const Dashboard = {
   async render() {
     Shell.render('hosts', `
       <div class="page-header">
         <div>
           <h1 class="page-title">Your <em>fleet</em></h1>
-          <div class="page-sub">All servers you've added to NeevCloud Monitoring.</div>
+          <p class="page-sub">All servers registered for monitoring.</p>
         </div>
-        <a href="#/add" class="btn btn-primary" style="width:auto">
-          + Add host
-        </a>
+        <div class="page-header-actions">
+          <a href="#/add" class="btn btn-primary" style="text-decoration:none;">+ Add host</a>
+        </div>
       </div>
-      <div id="content"><div class="center-loader"><span class="loader"></span></div></div>
+      <div id="content"><div class="c-loader"><span class="spin"></span></div></div>
     `);
 
     try {
-      const [{ hosts }, problemsRes] = await Promise.all([
+      const [{ hosts }, prRes] = await Promise.all([
         API.listHosts(),
         API.allProblems().catch(() => ({ problems: [] })),
       ]);
-      const problemCount = (problemsRes.problems || []).length;
-      this.renderContent(hosts, problemCount);
+      this._render(hosts, (prRes.problems || []).length);
     } catch (e) {
-      document.getElementById('content').innerHTML = `<div class="empty"><h3>Couldn't load hosts</h3><p>${e.message}</p></div>`;
+      document.getElementById('content').innerHTML =
+        `<div class="empty"><h3>Could not load hosts</h3><p>${esc(e.message)}</p></div>`;
     }
   },
 
-  renderContent(hosts, problemCount) {
-    const container = document.getElementById('content');
-
+  _render(hosts, problemCount) {
+    const el = document.getElementById('content');
     if (!hosts || hosts.length === 0) {
-      container.innerHTML = `
+      el.innerHTML = `
         <div class="empty">
           <h3>No hosts yet</h3>
-          <p>Add your first server to start receiving CPU, memory, storage, and uptime metrics in real time.</p>
-          <a href="#/add" class="btn btn-primary" style="width:auto; display:inline-flex;">+ Add your first host</a>
-        </div>
-      `;
+          <p>Add your first server to start collecting CPU, RAM, storage, uptime and alert data in real time.</p>
+          <a href="#/add" class="btn btn-primary" style="display:inline-flex;text-decoration:none;margin-top:8px;">+ Add your first host</a>
+        </div>`;
       return;
     }
 
-    const okCount = hosts.filter(h => h.zabbix && h.zabbix.interfaces && h.zabbix.interfaces[0] && h.zabbix.interfaces[0].available === '1').length;
-    const pendingCount = hosts.length - okCount;
+    const online  = hosts.filter(h => h.zabbix?.interfaces?.[0]?.available === '1').length;
+    const waiting = hosts.length - online;
 
-    container.innerHTML = `
-      <div class="stat-grid">
+    el.innerHTML = `
+      <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:20px;">
         <div class="stat-card">
           <div class="stat-label">Total hosts</div>
-          <div class="stat-value">${hosts.length}</div>
-          <div class="stat-foot">Servers registered for monitoring</div>
+          <div class="stat-val">${hosts.length}</div>
+          <div class="stat-foot">Registered</div>
         </div>
         <div class="stat-card">
           <div class="stat-label">Online</div>
-          <div class="stat-value" style="color:var(--accent)">${okCount}</div>
-          <div class="stat-foot">Agents reporting healthy</div>
+          <div class="stat-val ok">${online}</div>
+          <div class="stat-foot">Agents reporting</div>
         </div>
         <div class="stat-card">
-          <div class="stat-label">Awaiting agent</div>
-          <div class="stat-value" style="color:var(--accent-warm)">${pendingCount}</div>
-          <div class="stat-foot">Run the install command on these</div>
+          <div class="stat-label">Waiting</div>
+          <div class="stat-val warn">${waiting}</div>
+          <div class="stat-foot">Run install command</div>
         </div>
         <div class="stat-card">
-          <div class="stat-label">Active alerts</div>
-          <div class="stat-value" style="color:${problemCount > 0 ? 'var(--danger)' : 'var(--text-1)'}">${problemCount}</div>
+          <div class="stat-label">Alerts</div>
+          <div class="stat-val ${problemCount > 0 ? 'crit' : ''}">${problemCount}</div>
           <div class="stat-foot"><a href="#/alerts">View alerts →</a></div>
         </div>
       </div>
 
-      <div class="section-title">Hosts</div>
       <table class="host-table">
         <thead>
           <tr>
             <th>Name</th>
             <th>OS / Mode</th>
             <th>Status</th>
-            <th>Created</th>
+            <th>Added</th>
             <th></th>
           </tr>
         </thead>
         <tbody>
-          ${hosts.map(h => this.hostRow(h)).join('')}
+          ${hosts.map(h => this._row(h)).join('')}
         </tbody>
       </table>
     `;
 
-    // Wire up clicks
-    container.querySelectorAll('[data-host-id]').forEach(tr => {
-      tr.onclick = (e) => {
+    el.querySelectorAll('[data-hid]').forEach(tr => {
+      tr.onclick = e => {
         if (e.target.closest('button')) return;
-        location.hash = '#/host/' + tr.dataset.hostId;
+        location.hash = '#/host/' + tr.dataset.hid;
       };
     });
-    container.querySelectorAll('[data-delete]').forEach(btn => {
-      btn.onclick = async (e) => {
+
+    el.querySelectorAll('[data-del]').forEach(btn => {
+      btn.onclick = async e => {
         e.stopPropagation();
-        const id = btn.dataset.delete;
-        if (!confirm('Delete this host? Monitoring data and config will be removed.')) return;
+        if (!confirm('Delete this host and remove it from monitoring?')) return;
+        btn.disabled = true;
         try {
-          await API.deleteHost(id);
+          await API.deleteHost(btn.dataset.del);
           toast('Host deleted');
           Dashboard.render();
-        } catch (err) { toast(err.message, 'err'); }
+        } catch (err) { toast(err.message, 'err'); btn.disabled = false; }
       };
     });
   },
 
-  hostRow(h) {
-    const iface = h.zabbix && h.zabbix.interfaces && h.zabbix.interfaces[0];
-    let pill, dotClass;
-    if (!h.zabbix) {
-      pill = 'Unknown'; dotClass = 'status-pending';
-    } else if (iface && iface.available === '1') {
-      pill = 'Online'; dotClass = 'status-ok';
-    } else if (iface && iface.available === '2') {
-      pill = 'Unreachable'; dotClass = 'status-err';
-    } else {
-      pill = 'Waiting for agent'; dotClass = 'status-pending';
-    }
+  _row(h) {
+    const iface = h.zabbix?.interfaces?.[0];
+    let pill;
+    if (!h.zabbix)                    pill = `<span class="pill pill-warn"><span class="dot"></span>Unknown</span>`;
+    else if (iface?.available === '1') pill = `<span class="pill pill-ok"><span class="dot"></span>Online</span>`;
+    else if (iface?.available === '2') pill = `<span class="pill pill-err"><span class="dot"></span>Unreachable</span>`;
+    else                               pill = `<span class="pill pill-warn"><span class="dot"></span>Waiting</span>`;
 
-    const created = new Date(h.created_at + 'Z').toLocaleString();
+    const osLabel = h.os_type === 'windows' ? 'Windows' : 'Linux';
+    const created = new Date(h.created_at + 'Z').toLocaleDateString();
 
     return `
-      <tr data-host-id="${h.id}">
-        <td>
-          <div class="host-name">${escapeHtml(h.visible_name)}</div>
-          <div class="host-meta">${h.host_name}</div>
-        </td>
-        <td>
-          ${h.os_type === 'linux' ? 'Linux' : 'Windows'}
-          <div class="host-meta">${h.agent_mode}</div>
-        </td>
-        <td><span class="status-pill ${dotClass}"><span class="dot"></span>${pill}</span></td>
-        <td style="color:var(--text-3);font-size:13px;">${created}</td>
-        <td>
-          <button class="btn btn-ghost btn-sm" data-delete="${h.id}" title="Delete host">${svg.trash}</button>
-        </td>
-      </tr>
-    `;
+      <tr data-hid="${h.id}">
+        <td><div class="hn">${esc(h.visible_name)}</div><div class="hm">${esc(h.host_name)}</div></td>
+        <td>${osLabel}<div class="hm">${h.agent_mode}</div></td>
+        <td>${pill}</td>
+        <td style="color:var(--t3);font-size:12px;">${created}</td>
+        <td><button class="btn btn-ghost btn-sm" data-del="${h.id}" title="Delete">${TRASH_ICON}</button></td>
+      </tr>`;
   },
 };
-
-function escapeHtml(s) {
-  return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
