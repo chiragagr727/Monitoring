@@ -355,6 +355,21 @@ const HostDetail = {
     if (defChart) this._loadChart(id, defChart, this._currentRange);
   },
 
+
+  _fmtMetricVal(val, units) {
+    if (!val || val === '') return '—';
+    if (units === 'B') {
+      const n = parseFloat(val);
+      if (isNaN(n)) return val;
+      if (n >= 1073741824) return (n/1073741824).toFixed(2) + ' GB';
+      if (n >= 1048576)    return (n/1048576).toFixed(1) + ' MB';
+      if (n >= 1024)       return (n/1024).toFixed(1) + ' KB';
+      return n + ' B';
+    }
+    if (units === '%') return parseFloat(val).toFixed(2) + '%';
+    return val + (units ? ' ' + units : '');
+  },
+
   _renderGroups(metrics) {
     const g = { CPU:{icon:'⚙️',items:[]}, Memory:{icon:'🧠',items:[]}, Disk:{icon:'💾',items:[]}, Network:{icon:'🌐',items:[]}, System:{icon:'🖥',items:[]}, Other:{icon:'📊',items:[]} };
     metrics.forEach(m => {
@@ -380,7 +395,12 @@ const HostDetail = {
                 <div class="metric-k">${esc(m.name)}</div>
                 <div class="metric-sub">${esc(m.key_)}</div>
               </div>
-              <div class="metric-v">${esc(m.lastvalue||'—')}${m.units?' '+esc(m.units):''}</div>
+              <div class="metric-v">${(()=>{
+                const v=m.lastvalue,u=m.units;
+                if(!v||v==='')return'—';
+                if(u==='B'){const n=parseFloat(v);if(n>=1073741824)return(n/1073741824).toFixed(2)+' GB';if(n>=1048576)return(n/1048576).toFixed(1)+' MB';if(n>=1024)return(n/1024).toFixed(1)+' KB';return n+' B';}
+                return esc(v)+(u?' '+esc(u):'');
+              })()}</div>
             </div>`).join('')}
         </div>
       </div>`).join('');
